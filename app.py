@@ -1,6 +1,8 @@
 import json
+import time
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 from uuid import uuid4
 
 import requests
@@ -51,6 +53,74 @@ def chat_completion(*, hf_token: str, messages: list[dict], temperature: float, 
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"Unexpected response shape: {json.dumps(data, ensure_ascii=False)[:2000]}") from exc
+
+
+def chat_completion_stream(
+    *, hf_token: str, messages: list[dict], temperature: float, max_tokens: int
+) -> Iterator[str]:
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+
+    try:
+        resp = requests.post(
+            HF_ROUTER_URL,
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=60,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Network error calling Hugging Face Router: {exc}") from exc
+
+    if not resp.ok:
+        body_preview = resp.text.strip()
+        raise RuntimeError(f"Router error {resp.status_code}: {body_preview[:2000]}")
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+
+        payload_text = line[len("data:") :].strip()
+        if payload_text == "[DONE]":
+            return
+
+        try:
+            event = json.loads(payload_text)
+        except ValueError:
+            continue
+
+        if isinstance(event, dict) and "error" in event:
+            raise RuntimeError(f"Router error: {json.dumps(event['error'], ensure_ascii=False)[:2000]}")
+
+        try:
+            choice0 = event["choices"][0]
+        except (TypeError, KeyError, IndexError):
+            continue
+
+        chunk = ""
+        if isinstance(choice0, dict):
+            delta = choice0.get("delta")
+            if isinstance(delta, dict):
+                chunk = delta.get("content") or ""
+            if not chunk:
+                msg = choice0.get("message")
+                if isinstance(msg, dict):
+                    chunk = msg.get("content") or ""
+
+        if chunk:
+            yield chunk
 
 
 def now_iso() -> str:
@@ -301,14 +371,20 @@ if user_text:
 
     with history:
         with st.chat_message("assistant"):
+            placeholder = st.empty()
+            full_text = ""
             with st.spinner("Thinking…"):
                 try:
-                    assistant_text = chat_completion(
+                    for chunk in chat_completion_stream(
                         hf_token=hf_token,
                         messages=active_chat["messages"],
                         temperature=temperature,
                         max_tokens=max_tokens,
-                    )
+                    ):
+                        full_text += chunk
+                        placeholder.markdown(full_text)
+                        time.sleep(0.02)
+                    assistant_text = full_text
                 except RuntimeError as exc:
                     error_text = str(exc)
                     if "Router error 401" in error_text or "Router error 403" in error_text:
@@ -319,8 +395,6 @@ if user_text:
                         error_text = "Rate limit exceeded (429). Please wait a bit and try again."
                     st.error(error_text)
                     assistant_text = f"Error: {error_text}"
-                else:
-                    st.markdown(assistant_text)
 
     active_chat["messages"].append({"role": "assistant", "content": assistant_text})
     active_chat["updated_at"] = now_iso()
