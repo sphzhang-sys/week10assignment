@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 import requests
@@ -8,6 +9,7 @@ import streamlit as st
 HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
 MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_SYSTEM_MESSAGE = {"role": "system", "content": "You are a helpful assistant."}
+CHATS_DIR = Path("chats")
 
 
 def chat_completion(*, hf_token: str, messages: list[dict], temperature: float, max_tokens: int) -> str:
@@ -74,6 +76,93 @@ def new_chat() -> dict:
     }
 
 
+def load_chats_from_disk() -> list[dict]:
+    CHATS_DIR.mkdir(exist_ok=True)
+    chats: list[dict] = []
+    for path in sorted(CHATS_DIR.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+
+        if not isinstance(raw, dict):
+            continue
+
+        chat_id = raw.get("id")
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            continue
+
+        title = raw.get("title")
+        if not isinstance(title, str) or not title.strip():
+            title = "New chat"
+
+        created_at = raw.get("created_at")
+        if not isinstance(created_at, str) or not created_at.strip():
+            created_at = now_iso()
+
+        updated_at = raw.get("updated_at")
+        if not isinstance(updated_at, str) or not updated_at.strip():
+            updated_at = created_at
+
+        messages = raw.get("messages")
+        if not isinstance(messages, list):
+            messages = [DEFAULT_SYSTEM_MESSAGE.copy()]
+
+        normalized_messages: list[dict] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = msg.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                continue
+            normalized_messages.append({"role": role, "content": content})
+
+        if not normalized_messages or normalized_messages[0].get("role") != "system":
+            normalized_messages.insert(0, DEFAULT_SYSTEM_MESSAGE.copy())
+
+        chats.append(
+            {
+                "id": chat_id,
+                "title": title,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "messages": normalized_messages,
+            }
+        )
+    return chats
+
+
+def save_chat_to_disk(chat: dict) -> None:
+    CHATS_DIR.mkdir(exist_ok=True)
+    chat_id = chat.get("id")
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        return
+
+    data = {
+        "id": chat_id,
+        "title": chat.get("title") or "New chat",
+        "created_at": chat.get("created_at") or now_iso(),
+        "updated_at": chat.get("updated_at") or now_iso(),
+        "messages": chat.get("messages") or [DEFAULT_SYSTEM_MESSAGE.copy()],
+    }
+
+    tmp_path = CHATS_DIR / f"{chat_id}.json.tmp"
+    final_path = CHATS_DIR / f"{chat_id}.json"
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(final_path)
+
+
+def delete_chat_file(chat_id: str) -> None:
+    if not chat_id:
+        return
+    path = CHATS_DIR / f"{chat_id}.json"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
 def get_active_chat() -> dict | None:
     active_chat_id = st.session_state.get("active_chat_id")
     for chat in st.session_state.get("chats", []):
@@ -106,6 +195,10 @@ if "chats" not in st.session_state:
 if "active_chat_id" not in st.session_state:
     st.session_state["active_chat_id"] = None
 
+if "disk_loaded" not in st.session_state:
+    st.session_state["chats"] = load_chats_from_disk()
+    st.session_state["disk_loaded"] = True
+
 if "messages" in st.session_state and not st.session_state["chats"]:
     migrated = new_chat()
     migrated["messages"] = st.session_state["messages"]
@@ -113,6 +206,7 @@ if "messages" in st.session_state and not st.session_state["chats"]:
     migrated["updated_at"] = now_iso()
     st.session_state["chats"] = [migrated]
     st.session_state["active_chat_id"] = migrated["id"]
+    save_chat_to_disk(migrated)
     st.session_state.pop("messages", None)
 
 if st.session_state["active_chat_id"] is None and st.session_state["chats"]:
@@ -128,6 +222,7 @@ with st.sidebar:
         created = new_chat()
         st.session_state["chats"].append(created)
         st.session_state["active_chat_id"] = created["id"]
+        save_chat_to_disk(created)
         st.rerun()
 
     active_chat = get_active_chat()
@@ -135,6 +230,7 @@ with st.sidebar:
         if active_chat is not None:
             active_chat["messages"] = [DEFAULT_SYSTEM_MESSAGE.copy()]
             active_chat["updated_at"] = now_iso()
+            save_chat_to_disk(active_chat)
         st.rerun()
 
     st.divider()
@@ -164,6 +260,7 @@ with st.sidebar:
             with cols[1]:
                 if st.button("✕", key=f"del_{chat_id}", type="tertiary", use_container_width=True):
                     st.session_state["chats"] = [c for c in st.session_state["chats"] if c.get("id") != chat_id]
+                    delete_chat_file(chat_id)
                     if st.session_state.get("active_chat_id") == chat_id:
                         if st.session_state["chats"]:
                             most_recent_remaining = max(
@@ -196,6 +293,7 @@ if user_text:
     active_chat["updated_at"] = now_iso()
     if active_chat.get("title") == "New chat":
         active_chat["title"] = (user_text.strip() or "New chat")[:40]
+    save_chat_to_disk(active_chat)
 
     with history:
         with st.chat_message("user"):
@@ -226,3 +324,4 @@ if user_text:
 
     active_chat["messages"].append({"role": "assistant", "content": assistant_text})
     active_chat["updated_at"] = now_iso()
+    save_chat_to_disk(active_chat)
