@@ -71,36 +71,50 @@ with st.sidebar:
     st.header("Settings")
     temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=0.7, step=0.1)
     max_tokens = st.slider("Max tokens", min_value=16, max_value=2048, value=256, step=16)
-    if st.button("Re-run test"):
-        st.session_state.pop("test_result", None)
+    if st.button("Clear chat"):
+        st.session_state["messages"] = [{"role": "system", "content": "You are a helpful assistant."}]
         st.rerun()
 
-TEST_MESSAGES = [{"role": "user", "content": "Hello!"}]
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [{"role": "system", "content": "You are a helpful assistant."}]
 
-if "test_result" not in st.session_state:
-    with st.spinner("Sending test message to Hugging Face…"):
-        try:
-            assistant_text = chat_completion(
-                hf_token=hf_token,
-                messages=TEST_MESSAGES,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            st.session_state["test_result"] = {"ok": True, "text": assistant_text}
-        except RuntimeError as exc:
-            error_text = str(exc)
-            if "Router error 401" in error_text or "Router error 403" in error_text:
-                error_text = (
-                    "Authentication failed (401/403). Your `HF_TOKEN` is missing/invalid or lacks permissions."
-                )
-            elif "Router error 429" in error_text:
-                error_text = "Rate limit exceeded (429). Wait a bit and click “Re-run test”."
-            st.session_state["test_result"] = {"ok": False, "text": error_text}
+history = st.container(height=600)
+with history:
+    for msg in st.session_state["messages"]:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "system":
+            continue
+        with st.chat_message(role):
+            st.markdown(content)
 
-result = st.session_state["test_result"]
-st.subheader('Test prompt: "Hello!"')
-if result.get("ok"):
-    st.success("Received a response from the model.")
-    st.write(result.get("text", ""))
-else:
-    st.error(result.get("text", "Unknown error."))
+user_text = st.chat_input("Type your message…")
+if user_text:
+    st.session_state["messages"].append({"role": "user", "content": user_text})
+    with history:
+        with st.chat_message("user"):
+            st.markdown(user_text)
+
+    with history:
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                try:
+                    assistant_text = chat_completion(
+                        hf_token=hf_token,
+                        messages=st.session_state["messages"],
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                except RuntimeError as exc:
+                    error_text = str(exc)
+                    if "Router error 401" in error_text or "Router error 403" in error_text:
+                        error_text = (
+                            "Authentication failed (401/403). Your `HF_TOKEN` is missing/invalid or lacks permissions."
+                        )
+                    elif "Router error 429" in error_text:
+                        error_text = "Rate limit exceeded (429). Please wait a bit and try again."
+                    st.error(error_text)
+                    st.session_state["messages"].append({"role": "assistant", "content": f"Error: {error_text}"})
+                else:
+                    st.markdown(assistant_text)
+                    st.session_state["messages"].append({"role": "assistant", "content": assistant_text})
