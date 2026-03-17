@@ -12,6 +12,7 @@ HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
 MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_SYSTEM_MESSAGE = {"role": "system", "content": "You are a helpful assistant."}
 CHATS_DIR = Path("chats")
+MEMORY_PATH = Path("memory.json")
 
 
 def chat_completion(*, hf_token: str, messages: list[dict], temperature: float, max_tokens: int) -> str:
@@ -233,6 +234,100 @@ def delete_chat_file(chat_id: str) -> None:
         return
 
 
+def load_memory() -> dict:
+    try:
+        raw = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, ValueError, TypeError):
+        raw = {}
+
+    if not isinstance(raw, dict):
+        raw = {}
+
+    traits = raw.get("traits")
+    if not isinstance(traits, dict):
+        traits = {}
+
+    updated_at = raw.get("updated_at")
+    if not isinstance(updated_at, str) or not updated_at.strip():
+        updated_at = now_iso()
+
+    return {"traits": traits, "updated_at": updated_at}
+
+
+def save_memory(memory: dict) -> None:
+    if not isinstance(memory, dict):
+        return
+
+    traits = memory.get("traits")
+    if not isinstance(traits, dict):
+        traits = {}
+
+    data = {"traits": traits, "updated_at": memory.get("updated_at") or now_iso()}
+    tmp_path = MEMORY_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(MEMORY_PATH)
+
+
+def merge_memory(existing: object, incoming: object) -> object:
+    if isinstance(existing, dict) and isinstance(incoming, dict):
+        merged = dict(existing)
+        for key, value in incoming.items():
+            if key in merged:
+                merged[key] = merge_memory(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    if isinstance(existing, list) and isinstance(incoming, list):
+        merged_list = list(existing)
+        for item in incoming:
+            if item not in merged_list:
+                merged_list.append(item)
+        return merged_list
+
+    return incoming
+
+
+def extract_json_object(text: str) -> dict:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+    try:
+        obj = json.loads(cleaned)
+    except (ValueError, TypeError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def extract_memory_from_user_message(*, hf_token: str, user_text: str, existing_traits: dict) -> dict:
+    system_prompt = (
+        "You extract personal traits and preferences about the user from a single user message.\n"
+        "Return ONLY a valid JSON object with any new or updated traits.\n"
+        "If there are no traits, return {}.\n"
+        "Do not include markdown, code fences, or explanations."
+    )
+    user_prompt = (
+        f"Existing traits JSON:\n{json.dumps(existing_traits, ensure_ascii=False)}\n\n"
+        f"User message:\n{user_text}\n\n"
+        "Return JSON:"
+    )
+
+    text = chat_completion(
+        hf_token=hf_token,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+        max_tokens=256,
+    )
+    return extract_json_object(text)
+
+
 def get_active_chat() -> dict | None:
     active_chat_id = st.session_state.get("active_chat_id")
     for chat in st.session_state.get("chats", []):
@@ -269,6 +364,10 @@ if "disk_loaded" not in st.session_state:
     st.session_state["chats"] = load_chats_from_disk()
     st.session_state["disk_loaded"] = True
 
+if "memory_loaded" not in st.session_state:
+    st.session_state["memory"] = load_memory()
+    st.session_state["memory_loaded"] = True
+
 if "messages" in st.session_state and not st.session_state["chats"]:
     migrated = new_chat()
     migrated["messages"] = st.session_state["messages"]
@@ -287,6 +386,18 @@ with st.sidebar:
     st.header("Settings")
     temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=0.7, step=0.1)
     max_tokens = st.slider("Max tokens", min_value=16, max_value=2048, value=256, step=16)
+
+    with st.expander("User Memory", expanded=False):
+        memory = st.session_state.get("memory") or {"traits": {}}
+        traits = memory.get("traits") if isinstance(memory, dict) else {}
+        if isinstance(traits, dict) and traits:
+            st.json(traits)
+        else:
+            st.write("No memory saved yet.")
+        if st.button("Clear memory", type="secondary", use_container_width=True):
+            st.session_state["memory"] = {"traits": {}, "updated_at": now_iso()}
+            save_memory(st.session_state["memory"])
+            st.rerun()
 
     if st.button("New Chat", type="primary", use_container_width=True):
         created = new_chat()
@@ -369,6 +480,24 @@ if user_text:
         with st.chat_message("user"):
             st.markdown(user_text)
 
+    memory = st.session_state.get("memory") if isinstance(st.session_state.get("memory"), dict) else {"traits": {}}
+    traits = memory.get("traits") if isinstance(memory.get("traits"), dict) else {}
+    base_system = DEFAULT_SYSTEM_MESSAGE["content"]
+    if traits:
+        system_with_memory = (
+            f"{base_system}\n\nUser memory (JSON):\n{json.dumps(traits, ensure_ascii=False)}\n\n"
+            "Use the user memory to personalize your responses when relevant."
+        )
+    else:
+        system_with_memory = base_system
+
+    request_messages = []
+    for idx, msg in enumerate(active_chat["messages"]):
+        if idx == 0 and msg.get("role") == "system":
+            request_messages.append({"role": "system", "content": system_with_memory})
+        else:
+            request_messages.append(msg)
+
     with history:
         with st.chat_message("assistant"):
             placeholder = st.empty()
@@ -377,7 +506,7 @@ if user_text:
                 try:
                     for chunk in chat_completion_stream(
                         hf_token=hf_token,
-                        messages=active_chat["messages"],
+                        messages=request_messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
                     ):
@@ -399,3 +528,19 @@ if user_text:
     active_chat["messages"].append({"role": "assistant", "content": assistant_text})
     active_chat["updated_at"] = now_iso()
     save_chat_to_disk(active_chat)
+
+    if not assistant_text.startswith("Error:"):
+        try:
+            extracted = extract_memory_from_user_message(
+                hf_token=hf_token,
+                user_text=user_text,
+                existing_traits=traits if isinstance(traits, dict) else {},
+            )
+        except RuntimeError as exc:
+            st.sidebar.warning(f"Memory extraction failed: {exc}")
+        else:
+            if extracted:
+                merged_traits = merge_memory(traits, extracted)
+                if isinstance(merged_traits, dict):
+                    st.session_state["memory"] = {"traits": merged_traits, "updated_at": now_iso()}
+                    save_memory(st.session_state["memory"])
